@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
-.env
 *.zip
-node_modules/
+.env
 .DS_Store
+node_modules/
+*.egg-info/
+dist/
+build/
+.vscode/
