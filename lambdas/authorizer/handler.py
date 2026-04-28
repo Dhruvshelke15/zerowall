@@ -5,7 +5,7 @@ Runs on every protected API request. Validates the JWT, looks up the
 caller's role permissions, and returns an IAM policy that either allows
 or denies the specific method+resource being requested.
 
-Returned context (userId, role, email) is forwarded to downstream
+Returned context (userId, role, username) is forwarded to downstream
 Lambdas via event.requestContext.authorizer.
 """
 
@@ -68,9 +68,15 @@ def lambda_handler(event, context):
         raise Exception("Unauthorized")
 
     user_id = claims.get("sub")
-    role = claims.get("custom:role") or claims.get("cognito:groups") or "user"
-    # 'username' is on access tokens; ID token uses 'cognito:username'
-    username = claims.get("username") or claims.get("cognito:username", "")
+
+    # No silent default. If the token doesn't carry a role, fail closed.
+    role = claims.get("custom:role")
+    if not role:
+        logger.info("Auth failed: token missing custom:role claim")
+        raise Exception("Unauthorized")
+
+    # ID tokens use 'cognito:username'; access tokens use 'username'.
+    username = claims.get("cognito:username") or claims.get("username", "")
 
     # 3. Pull HTTP method and resource path from the methodArn.
     # methodArn format:

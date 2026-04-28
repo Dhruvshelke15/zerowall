@@ -6,8 +6,10 @@ Handles:
 - Verifying JWT signature, expiration, issuer, and token_use
 - Returning decoded claims for downstream RBAC checks
 
-Cognito access tokens do not contain an 'aud' claim (only ID tokens do).
-We verify 'client_id' instead, which is the correct field for access tokens.
+We verify Cognito ID tokens (not access tokens) because custom attributes
+like 'custom:role' live in the ID token. Cognito only adds custom claims
+to the access token if the user pool is on the Essentials/Plus feature
+plan, which this project intentionally avoids to stay on Free Tier.
 """
 
 import json
@@ -81,11 +83,14 @@ def _get_signing_key(kid):
 
 def verify_token(token):
     """
-    Verify a Cognito access token end to end.
+    Verify a Cognito ID token end to end.
 
     Returns the decoded claims dict on success.
     Raises jwt.InvalidTokenError (or a subclass like ExpiredSignatureError)
     on any failure.
+
+    ID tokens contain the 'aud' claim (set to the app client ID) and
+    custom user attributes such as 'custom:role'.
     """
     expected_client_id = os.environ["COGNITO_CLIENT_ID"]
     expected_issuer = _get_issuer()
@@ -98,23 +103,20 @@ def verify_token(token):
 
     signing_key = _get_signing_key(kid)
 
-    # PyJWT verifies signature, exp, nbf, iat, and iss for us.
-    # We do not pass 'audience' because access tokens don't have an 'aud' claim.
+    # PyJWT verifies signature, exp, nbf, iat, iss, and aud for us.
     claims = jwt.decode(
         token,
         key=signing_key,
         algorithms=["RS256"],
         issuer=expected_issuer,
-        options={"require": ["exp", "iss", "sub", "token_use", "client_id"]},
+        audience=expected_client_id,
+        options={"require": ["exp", "iss", "sub", "token_use", "aud"]},
     )
 
-    # Cognito-specific checks PyJWT doesn't do for us
-    if claims.get("token_use") != "access":
+    # Cognito-specific check PyJWT doesn't do for us
+    if claims.get("token_use") != "id":
         raise jwt.InvalidTokenError(
-            f"Expected access token, got token_use={claims.get('token_use')}"
+            f"Expected ID token, got token_use={claims.get('token_use')}"
         )
-
-    if claims.get("client_id") != expected_client_id:
-        raise jwt.InvalidTokenError("Token client_id does not match expected app client")
 
     return claims
