@@ -2,14 +2,21 @@
 
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Key
 
-dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-2"))
-notes_table = dynamodb.Table("zerowall-notes") # type: ignore
+import rate_limiter
+import audit_logger
+
+APP_REGION = os.environ.get("APP_REGION", "us-east-2")
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "100"))
+
+dynamodb = boto3.resource("dynamodb", region_name=APP_REGION)
+notes_table = dynamodb.Table("zerowall-notes")  # type: ignore
 
 # Title and content length limits
 MAX_TITLE_LENGTH = 200
@@ -18,28 +25,50 @@ MAX_CONTENT_LENGTH = 5000
 
 def lambda_handler(event, context):
     """Routes incoming API Gateway requests to the correct CRUD handler."""
+    start_ms = int(time.time() * 1000)
+
     path = event.get("path", "")
     method = event.get("httpMethod", "")
     path_params = event.get("pathParameters") or {}
 
-    authorizer = event.get("requestContext", {}).get("authorizer", {})
+    request_context = event.get("requestContext", {}) or {}
+    authorizer = request_context.get("authorizer", {}) or {}
     user_id = authorizer.get("userId")
     role = authorizer.get("role", "user")
+
+    identity = request_context.get("identity") or {}
+    source_ip = identity.get("sourceIp", "unknown")
+    user_agent = identity.get("userAgent", "unknown")
 
     if not user_id:
         return response(401, {"status": "error", "error": "UNAUTHORIZED", "message": "Missing user context from authorizer."})
 
+    # Rate limit check before any business logic.
+    try:
+        allowed, _count, retry_after = rate_limiter.check_and_increment(user_id, RATE_LIMIT_PER_MINUTE)
+    except Exception as e:
+        print(f"Rate limiter error: {e}")
+        latency = int(time.time() * 1000) - start_ms
+        audit_logger.log(user_id, method, path, source_ip, user_agent, "ERROR", 500, latency)
+        return response(500, {"status": "error", "error": "RATE_LIMITER_ERROR", "message": "Rate limiter unavailable."})
+
+    if not allowed:
+        latency = int(time.time() * 1000) - start_ms
+        audit_logger.log(user_id, method, path, source_ip, user_agent, "DENIED_RATE_LIMIT", 429, latency)
+        return response(
+            429,
+            {"status": "error", "error": "RATE_LIMITED", "message": f"Too many requests. Try again in {retry_after} seconds.", "retryAfter": retry_after},
+            extra_headers={"Retry-After": str(retry_after)},
+        )
+
     try:
         body = json.loads(event.get("body", "{}") or "{}")
     except json.JSONDecodeError:
+        latency = int(time.time() * 1000) - start_ms
+        audit_logger.log(user_id, method, path, source_ip, user_agent, "ERROR", 400, latency)
         return response(400, {"status": "error", "error": "INVALID_JSON", "message": "Request body must be valid JSON."})
 
     note_id = path_params.get("noteId")
-
-    # TODO Phase 3: Add rate limiting check here
-    # from rate_limiter import check_rate_limit
-    # if not check_rate_limit(user_id):
-    #     return response(429, {"status": "error", "error": "RATE_LIMITED", "message": "Too many requests. Try again in 60 seconds.", "retryAfter": 60})
 
     if path == "/notes" and method == "GET":
         result = handle_list_notes(user_id)
@@ -54,9 +83,11 @@ def lambda_handler(event, context):
     else:
         result = response(404, {"status": "error", "error": "NOT_FOUND", "message": "Route not found."})
 
-    # TODO Phase 3: Add audit logging here
-    # from audit_logger import log_request
-    # log_request(user_id, method, path, source_ip, result, status_code, latency_ms)
+    # Audit log every request that made it past rate limiting.
+    status_code = result.get("statusCode", 500)
+    audit_result = "ERROR" if status_code >= 500 else "ALLOWED"
+    latency = int(time.time() * 1000) - start_ms
+    audit_logger.log(user_id, method, path, source_ip, user_agent, audit_result, status_code, latency)
 
     return result
 
@@ -149,23 +180,29 @@ def handle_update_note(user_id, note_id, body):
 
     update_parts = ["updatedAt = :updatedAt"]
     expr_values = {":updatedAt": now}
+    expr_names = {}
 
     if title:
-        update_parts.append("title = :title")
+        update_parts.append("#title = :title")
         expr_values[":title"] = title
+        expr_names["#title"] = "title"
     if content is not None:
-        update_parts.append("content = :content")
+        update_parts.append("#content = :content")
         expr_values[":content"] = content
+        expr_names["#content"] = "content"
 
     update_expression = "SET " + ", ".join(update_parts)
 
     try:
-        result = notes_table.update_item(
-            Key={"userId": user_id, "noteId": note_id},
-            UpdateExpression=update_expression,
-            ExpressionAttributeValues=expr_values,
-            ReturnValues="ALL_NEW"
-        )
+        kwargs = {
+            "Key": {"userId": user_id, "noteId": note_id},
+            "UpdateExpression": update_expression,
+            "ExpressionAttributeValues": expr_values,
+            "ReturnValues": "ALL_NEW",
+        }
+        if expr_names:
+            kwargs["ExpressionAttributeNames"] = expr_names
+        result = notes_table.update_item(**kwargs)
         return response(200, {"status": "success", "data": result.get("Attributes", {})})
     except Exception as e:
         return response(500, {"status": "error", "error": "UPDATE_FAILED", "message": str(e)})
@@ -195,13 +232,16 @@ def handle_delete_note(user_id, note_id, role):
         return response(500, {"status": "error", "error": "DELETE_FAILED", "message": str(e)})
 
 
-def response(status_code, body):
+def response(status_code, body, extra_headers=None):
     """Build API Gateway compatible response."""
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     return {
         "statusCode": status_code,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-        },
+        "headers": headers,
         "body": json.dumps(body, default=str)
     }
