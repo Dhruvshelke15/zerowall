@@ -1,0 +1,242 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "# ZeroWall Monitoring Dashboard\nReal-time view of API security posture and traffic. Custom metrics on top, Lambda health in the middle, DynamoDB usage at the bottom."
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Auth Failures (1m sum)",
+        "metrics": [
+          ["zerowall", "AuthFailures", {"stat": "Sum", "label": "AuthFailures"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}},
+        "annotations": {
+          "horizontal": [
+            {"label": "Alarm threshold (>20 in 5m)", "value": 20}
+          ]
+        }
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Rate Limit Hits (1m sum)",
+        "metrics": [
+          ["zerowall", "RateLimitHits", {"stat": "Sum", "label": "RateLimitHits"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}},
+        "annotations": {
+          "horizontal": [
+            {"label": "Alarm threshold (>50 in 5m)", "value": 50}
+          ]
+        }
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Request Latency (ms)",
+        "metrics": [
+          ["zerowall", "RequestLatency", {"stat": "Average", "label": "Avg"}],
+          ["...", {"stat": "p95", "label": "p95"}],
+          ["...", {"stat": "Maximum", "label": "Max"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}},
+        "annotations": {
+          "horizontal": [
+            {"label": "Alarm threshold (avg >3000ms)", "value": 3000}
+          ]
+        }
+      }
+    },
+
+    {
+      "type": "text",
+      "x": 0,
+      "y": 7,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Lambda Health"
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Invocations (1m sum)",
+        "metrics": [
+          ["AWS/Lambda", "Invocations", "FunctionName", "zerowall-authorizer", {"stat": "Sum"}],
+          ["...", "zerowall-notes-handler", {"stat": "Sum"}],
+          ["...", "zerowall-auth-handler", {"stat": "Sum"}],
+          ["...", "zerowall-anomaly-checker", {"stat": "Sum"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Errors (1m sum)",
+        "metrics": [
+          ["AWS/Lambda", "Errors", "FunctionName", "zerowall-authorizer", {"stat": "Sum"}],
+          ["...", "zerowall-notes-handler", {"stat": "Sum"}],
+          ["...", "zerowall-auth-handler", {"stat": "Sum"}],
+          ["...", "zerowall-anomaly-checker", {"stat": "Sum"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 14,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Duration (avg ms)",
+        "metrics": [
+          ["AWS/Lambda", "Duration", "FunctionName", "zerowall-authorizer", {"stat": "Average"}],
+          ["...", "zerowall-notes-handler", {"stat": "Average"}],
+          ["...", "zerowall-auth-handler", {"stat": "Average"}],
+          ["...", "zerowall-anomaly-checker", {"stat": "Average"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 14,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Throttles (1m sum)",
+        "metrics": [
+          ["AWS/Lambda", "Throttles", "FunctionName", "zerowall-authorizer", {"stat": "Sum"}],
+          ["...", "zerowall-notes-handler", {"stat": "Sum"}],
+          ["...", "zerowall-auth-handler", {"stat": "Sum"}],
+          ["...", "zerowall-anomaly-checker", {"stat": "Sum"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+
+    {
+      "type": "text",
+      "x": 0,
+      "y": 20,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## DynamoDB Usage"
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 21,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "DynamoDB Read Capacity (1m sum)",
+        "metrics": [
+          ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "zerowall-notes", {"stat": "Sum"}],
+          ["...", "zerowall-roles", {"stat": "Sum"}],
+          ["...", "zerowall-rate-limits", {"stat": "Sum"}],
+          ["...", "zerowall-audit-log", {"stat": "Sum"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 21,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "DynamoDB Write Capacity (1m sum)",
+        "metrics": [
+          ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "zerowall-notes", {"stat": "Sum"}],
+          ["...", "zerowall-roles", {"stat": "Sum"}],
+          ["...", "zerowall-rate-limits", {"stat": "Sum"}],
+          ["...", "zerowall-audit-log", {"stat": "Sum"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-2",
+        "period": 60,
+        "yAxis": {"left": {"min": 0}}
+      }
+    }
+  ]
+}
