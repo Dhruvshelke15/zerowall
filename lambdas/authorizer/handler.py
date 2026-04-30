@@ -12,6 +12,7 @@ Lambdas via event.requestContext.authorizer.
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 import jwt
@@ -27,7 +28,36 @@ REGION = os.environ["APP_REGION"]
 ROLES_TABLE_NAME = os.environ.get("ROLES_TABLE", "zerowall-roles")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
-roles_table = dynamodb.Table(ROLES_TABLE_NAME) # type: ignore
+roles_table = dynamodb.Table(ROLES_TABLE_NAME)  # type: ignore
+
+
+# --------------------------------------------------------------------------
+# Structured logging
+# --------------------------------------------------------------------------
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _emit(result, **fields):
+    """
+    Emit a single-line JSON log entry to CloudWatch.
+    'result' is one of: ALLOWED, DENIED_AUTH, DENIED_RBAC.
+    Metric filters key off this field.
+    """
+    payload = {
+        "logType": "authz",
+        "timestamp": _now_iso(),
+        "result": result,
+        **fields,
+    }
+    print(json.dumps(payload, default=str))
+
+
+def _extract_source_ip(event):
+    rc = event.get("requestContext") or {}
+    identity = rc.get("identity") or {}
+    return identity.get("sourceIp", "unknown")
 
 
 # --------------------------------------------------------------------------
@@ -35,62 +65,56 @@ roles_table = dynamodb.Table(ROLES_TABLE_NAME) # type: ignore
 # --------------------------------------------------------------------------
 
 def lambda_handler(event, context):
-    """
-    REQUEST authorizer entry point.
-
-    event contains:
-      - methodArn: the full ARN of the method being invoked
-      - headers: request headers (case-insensitive lookup needed)
-      - httpMethod, path, resource: routing info
-    """
     method_arn = event.get("methodArn", "*")
+    source_ip = _extract_source_ip(event)
+    http_method, resource_path = _parse_method_arn(method_arn)
 
     # 1. Extract token. Missing or malformed = 401.
     try:
         token = _extract_token(event)
     except _UnauthorizedError as e:
-        logger.info("Auth failed (no token): %s", e)
-        # Raising this exact string makes API Gateway return 401 Unauthorized
+        _emit("DENIED_AUTH", reason="no_token", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
         raise Exception("Unauthorized")
 
     # 2. Verify token. Any failure = 401.
     try:
         claims = verify_token(token)
     except jwt.ExpiredSignatureError:
-        logger.info("Auth failed: token expired")
+        _emit("DENIED_AUTH", reason="token_expired",
+              action=http_method, resource=resource_path, sourceIp=source_ip)
         raise Exception("Unauthorized")
     except jwt.InvalidTokenError as e:
-        logger.info("Auth failed: invalid token (%s)", e)
+        _emit("DENIED_AUTH", reason="invalid_token", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
         raise Exception("Unauthorized")
     except Exception as e:
-        # Network errors fetching JWKS, etc. Treat as auth failure but log loud.
-        logger.exception("Unexpected error verifying token: %s", e)
+        logger.exception("Unexpected error verifying token")
+        _emit("DENIED_AUTH", reason="verify_error", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
         raise Exception("Unauthorized")
 
     user_id = claims.get("sub")
-
-    # No silent default. If the token doesn't carry a role, fail closed.
     role = claims.get("custom:role")
+
     if not role:
-        logger.info("Auth failed: token missing custom:role claim")
+        _emit("DENIED_AUTH", reason="missing_role_claim", userId=user_id,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
         raise Exception("Unauthorized")
 
-    # ID tokens use 'cognito:username'; access tokens use 'username'.
     username = claims.get("cognito:username") or claims.get("username", "")
 
-    # 3. Pull HTTP method and resource path from the methodArn.
-    # methodArn format:
-    #   arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<resource-path>
-    http_method, resource_path = _parse_method_arn(method_arn)
+    # 3. RBAC check.
+    allowed, rbac_reason = _is_allowed(role, http_method, resource_path)
 
-    # 4. RBAC check.
-    allowed = _is_allowed(role, http_method, resource_path)
-
-    effect = "Allow" if allowed else "Deny"
-    logger.info(
-        "Authz decision: user=%s role=%s method=%s path=%s -> %s",
-        user_id, role, http_method, resource_path, effect,
-    )
+    if allowed:
+        _emit("ALLOWED", userId=user_id, role=role,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        effect = "Allow"
+    else:
+        _emit("DENIED_RBAC", reason=rbac_reason, userId=user_id, role=role,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        effect = "Deny"
 
     return _build_policy(
         principal_id=user_id,
@@ -113,7 +137,6 @@ class _UnauthorizedError(Exception):
 
 
 def _extract_token(event):
-    """Pull the bearer token from the Authorization header (case-insensitive)."""
     headers = event.get("headers") or {}
     auth_header = None
     for key, value in headers.items():
@@ -132,64 +155,41 @@ def _extract_token(event):
 
 
 def _parse_method_arn(method_arn):
-    """
-    Parse out the HTTP method and resource path from the methodArn.
-
-    Example methodArn:
-      arn:aws:execute-api:us-east-2:123456:abcd1234/dev/GET/notes/xyz
-
-    The portion after the stage is "<METHOD>/<resource-path>".
-    """
     try:
-        # Split off the ARN prefix to get "<api-id>/<stage>/<METHOD>/<path...>"
         suffix = method_arn.split(":", 5)[5]
         parts = suffix.split("/", 3)
-        # parts: [api_id, stage, METHOD, path]
         method = parts[2].upper()
         path = "/" + (parts[3] if len(parts) > 3 else "")
         return method, path
     except (IndexError, AttributeError):
-        # Defensive: malformed methodArn shouldn't happen from API Gateway
         return "UNKNOWN", "/"
 
 
 def _is_allowed(role, http_method, resource_path):
     """
-    Look up the role in DynamoDB and check if it has permission for this
-    method + resource. Permission entries support a single-segment '*' wildcard
-    in the resource pattern (e.g. '/notes/*' matches '/notes/abc' but not
-    '/notes/abc/comments').
+    Returns (allowed: bool, reason: str). Reason is meaningful only on deny.
     """
     try:
         result = roles_table.get_item(Key={"role": role})
     except Exception as e:
-        logger.exception("Failed to query roles table: %s", e)
-        return False
+        logger.exception("Failed to query roles table")
+        return False, f"roles_lookup_error:{e}"
 
     item = result.get("Item")
     if not item:
-        logger.info("RBAC deny: role '%s' not found in roles table", role)
-        return False
+        return False, "role_not_found"
 
     permissions = item.get("permissions", [])
     for perm in permissions:
         pattern = perm.get("resource", "")
         actions = perm.get("actions", [])
         if _path_matches(pattern, resource_path) and http_method in actions:
-            return True
+            return True, ""
 
-    return False
+    return False, "no_matching_permission"
 
 
 def _path_matches(pattern, path):
-    """
-    Match a path against a pattern where '*' is a single-segment wildcard.
-
-    Examples:
-      '/notes'      matches '/notes'
-      '/notes/*'    matches '/notes/abc' but NOT '/notes/abc/comments'
-      '/notes'      does NOT match '/notes/abc'
-    """
     pattern_parts = [p for p in pattern.split("/") if p]
     path_parts = [p for p in path.split("/") if p]
 
@@ -205,7 +205,6 @@ def _path_matches(pattern, path):
 
 
 def _build_policy(principal_id, effect, method_arn, context):
-    """Build the IAM policy document API Gateway expects from an authorizer."""
     return {
         "principalId": principal_id or "anonymous",
         "policyDocument": {
@@ -218,6 +217,5 @@ def _build_policy(principal_id, effect, method_arn, context):
                 }
             ],
         },
-        # All values in context must be strings, numbers, or booleans.
         "context": {k: (v if v is not None else "") for k, v in context.items()},
     }
