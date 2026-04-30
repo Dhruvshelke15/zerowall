@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timezone, timedelta
 
@@ -8,7 +9,7 @@ AUDIT_LOG_TABLE = os.environ.get("AUDIT_LOG_TABLE", "zerowall-audit-log")
 AUDIT_LOG_TTL_DAYS = int(os.environ.get("AUDIT_LOG_TTL_DAYS", "30"))
 
 _dynamodb = boto3.resource("dynamodb", region_name=APP_REGION)
-_table = _dynamodb.Table(AUDIT_LOG_TABLE) # type: ignore
+_table = _dynamodb.Table(AUDIT_LOG_TABLE)  # type: ignore
 
 
 def _now_iso():
@@ -22,20 +23,27 @@ def _ttl():
 def log(user_id, action, resource, source_ip, user_agent, result, status_code, latency_ms):
     """
     Write one audit entry per request. Never raises - audit failures must not break the request.
+
+    Writes to two places:
+      1. DynamoDB zerowall-audit-log (queryable history)
+      2. CloudWatch via stdout as a single JSON line (used by metric filters)
     """
+    item = {
+        "userId": user_id,
+        "timestamp": _now_iso(),
+        "action": action,
+        "resource": resource,
+        "sourceIp": source_ip,
+        "userAgent": user_agent,
+        "result": result,
+        "statusCode": int(status_code),
+        "latencyMs": int(latency_ms),
+    }
+
+    # Emit structured log to CloudWatch (no ttl field, that's DynamoDB-only).
+    print(json.dumps({**item, "logType": "audit"}))
+
     try:
-        item = {
-            "userId": user_id,
-            "timestamp": _now_iso(),
-            "action": action,
-            "resource": resource,
-            "sourceIp": source_ip,
-            "userAgent": user_agent,
-            "result": result,
-            "statusCode": int(status_code),
-            "latencyMs": int(latency_ms),
-            "ttl": _ttl(),
-        }
-        _table.put_item(Item=item)
+        _table.put_item(Item={**item, "ttl": _ttl()})
     except Exception as e:
-        print(f"Audit log write failed: {e}")
+        print(json.dumps({"logType": "audit_write_error", "error": str(e)}))

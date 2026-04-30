@@ -1,247 +1,212 @@
-# Notes CRUD Lambda Handler
+
 
 import json
+import logging
 import os
-import time
-import uuid
 from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.conditions import Key
+import jwt
 
-import rate_limiter
-import audit_logger
+from jwt_utils import verify_token
 
-APP_REGION = os.environ.get("APP_REGION", "us-east-2")
-RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "100"))
 
-dynamodb = boto3.resource("dynamodb", region_name=APP_REGION)
-notes_table = dynamodb.Table("zerowall-notes")  # type: ignore
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Title and content length limits
-MAX_TITLE_LENGTH = 200
-MAX_CONTENT_LENGTH = 5000
 
+REGION = os.environ["APP_REGION"]
+ROLES_TABLE_NAME = os.environ.get("ROLES_TABLE", "zerowall-roles")
+
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+roles_table = dynamodb.Table(ROLES_TABLE_NAME)  # type: ignore
+
+
+# --------------------------------------------------------------------------
+# Structured logging
+# --------------------------------------------------------------------------
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _emit(result, **fields):
+    """
+    Emit a single-line JSON log entry to CloudWatch.
+    'result' is one of: ALLOWED, DENIED_AUTH, DENIED_RBAC.
+    Metric filters key off this field.
+    """
+    payload = {
+        "logType": "authz",
+        "timestamp": _now_iso(),
+        "result": result,
+        **fields,
+    }
+    print(json.dumps(payload, default=str))
+
+
+def _extract_source_ip(event):
+    rc = event.get("requestContext") or {}
+    identity = rc.get("identity") or {}
+    return identity.get("sourceIp", "unknown")
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
 
 def lambda_handler(event, context):
-    """Routes incoming API Gateway requests to the correct CRUD handler."""
-    start_ms = int(time.time() * 1000)
+    method_arn = event.get("methodArn", "*")
+    source_ip = _extract_source_ip(event)
+    http_method, resource_path = _parse_method_arn(method_arn)
 
-    path = event.get("path", "")
-    method = event.get("httpMethod", "")
-    path_params = event.get("pathParameters") or {}
-
-    request_context = event.get("requestContext", {}) or {}
-    authorizer = request_context.get("authorizer", {}) or {}
-    user_id = authorizer.get("userId")
-    role = authorizer.get("role", "user")
-
-    identity = request_context.get("identity") or {}
-    source_ip = identity.get("sourceIp", "unknown")
-    user_agent = identity.get("userAgent", "unknown")
-
-    if not user_id:
-        return response(401, {"status": "error", "error": "UNAUTHORIZED", "message": "Missing user context from authorizer."})
-
-    # Rate limit check before any business logic.
+    # 1. Extract token. Missing or malformed = 401.
     try:
-        allowed, _count, retry_after = rate_limiter.check_and_increment(user_id, RATE_LIMIT_PER_MINUTE)
+        token = _extract_token(event)
+    except _UnauthorizedError as e:
+        _emit("DENIED_AUTH", reason="no_token", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        raise Exception("Unauthorized")
+
+    # 2. Verify token. Any failure = 401.
+    try:
+        claims = verify_token(token)
+    except jwt.ExpiredSignatureError:
+        _emit("DENIED_AUTH", reason="token_expired",
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        raise Exception("Unauthorized")
+    except jwt.InvalidTokenError as e:
+        _emit("DENIED_AUTH", reason="invalid_token", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        raise Exception("Unauthorized")
     except Exception as e:
-        print(f"Rate limiter error: {e}")
-        latency = int(time.time() * 1000) - start_ms
-        audit_logger.log(user_id, method, path, source_ip, user_agent, "ERROR", 500, latency)
-        return response(500, {"status": "error", "error": "RATE_LIMITER_ERROR", "message": "Rate limiter unavailable."})
+        logger.exception("Unexpected error verifying token")
+        _emit("DENIED_AUTH", reason="verify_error", detail=str(e),
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        raise Exception("Unauthorized")
 
-    if not allowed:
-        latency = int(time.time() * 1000) - start_ms
-        audit_logger.log(user_id, method, path, source_ip, user_agent, "DENIED_RATE_LIMIT", 429, latency)
-        return response(
-            429,
-            {"status": "error", "error": "RATE_LIMITED", "message": f"Too many requests. Try again in {retry_after} seconds.", "retryAfter": retry_after},
-            extra_headers={"Retry-After": str(retry_after)},
-        )
+    user_id = claims.get("sub")
+    role = claims.get("custom:role")
 
-    try:
-        body = json.loads(event.get("body", "{}") or "{}")
-    except json.JSONDecodeError:
-        latency = int(time.time() * 1000) - start_ms
-        audit_logger.log(user_id, method, path, source_ip, user_agent, "ERROR", 400, latency)
-        return response(400, {"status": "error", "error": "INVALID_JSON", "message": "Request body must be valid JSON."})
+    if not role:
+        _emit("DENIED_AUTH", reason="missing_role_claim", userId=user_id,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        raise Exception("Unauthorized")
 
-    note_id = path_params.get("noteId")
+    username = claims.get("cognito:username") or claims.get("username", "")
 
-    if path == "/notes" and method == "GET":
-        result = handle_list_notes(user_id)
-    elif path == "/notes" and method == "POST":
-        result = handle_create_note(user_id, body)
-    elif note_id and method == "GET":
-        result = handle_get_note(user_id, note_id)
-    elif note_id and method == "PUT":
-        result = handle_update_note(user_id, note_id, body)
-    elif note_id and method == "DELETE":
-        result = handle_delete_note(user_id, note_id, role)
+    # 3. RBAC check.
+    allowed, rbac_reason = _is_allowed(role, http_method, resource_path)
+
+    if allowed:
+        _emit("ALLOWED", userId=user_id, role=role,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        effect = "Allow"
     else:
-        result = response(404, {"status": "error", "error": "NOT_FOUND", "message": "Route not found."})
+        _emit("DENIED_RBAC", reason=rbac_reason, userId=user_id, role=role,
+              action=http_method, resource=resource_path, sourceIp=source_ip)
+        effect = "Deny"
 
-    # Audit log every request that made it past rate limiting.
-    status_code = result.get("statusCode", 500)
-    audit_result = "ERROR" if status_code >= 500 else "ALLOWED"
-    latency = int(time.time() * 1000) - start_ms
-    audit_logger.log(user_id, method, path, source_ip, user_agent, audit_result, status_code, latency)
+    return _build_policy(
+        principal_id=user_id,
+        effect=effect,
+        method_arn=method_arn,
+        context={
+            "userId": user_id,
+            "role": role,
+            "username": username,
+        },
+    )
 
-    return result
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+class _UnauthorizedError(Exception):
+    pass
 
 
-def handle_list_notes(user_id):
+def _extract_token(event):
+    headers = event.get("headers") or {}
+    auth_header = None
+    for key, value in headers.items():
+        if key.lower() == "authorization":
+            auth_header = value
+            break
+
+    if not auth_header:
+        raise _UnauthorizedError("Authorization header missing")
+
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise _UnauthorizedError("Authorization header must be 'Bearer <token>'")
+
+    return parts[1]
+
+
+def _parse_method_arn(method_arn):
     try:
-        result = notes_table.query(
-            KeyConditionExpression=Key("userId").eq(user_id)
-        )
-        notes = result.get("Items", [])
-        return response(200, {
-            "status": "success",
-            "data": {
-                "notes": notes,
-                "count": len(notes)
-            }
-        })
-    except Exception as e:
-        return response(500, {"status": "error", "error": "LIST_FAILED", "message": str(e)})
+        suffix = method_arn.split(":", 5)[5]
+        parts = suffix.split("/", 3)
+        method = parts[2].upper()
+        path = "/" + (parts[3] if len(parts) > 3 else "")
+        return method, path
+    except (IndexError, AttributeError):
+        return "UNKNOWN", "/"
 
 
-def handle_create_note(user_id, body):
-    title = body.get("title", "").strip()
-    content = body.get("content", "").strip()
-
-    if not title:
-        return response(400, {"status": "error", "error": "MISSING_FIELDS", "message": "title is required."})
-
-    if len(title) > MAX_TITLE_LENGTH:
-        return response(400, {"status": "error", "error": "VALIDATION_ERROR", "message": f"Title must be under {MAX_TITLE_LENGTH} characters."})
-
-    if len(content) > MAX_CONTENT_LENGTH:
-        return response(400, {"status": "error", "error": "VALIDATION_ERROR", "message": f"Content must be under {MAX_CONTENT_LENGTH} characters."})
-
-    note_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
-    item = {
-        "userId": user_id,
-        "noteId": note_id,
-        "title": title,
-        "content": content,
-        "createdAt": now,
-        "updatedAt": now,
-    }
-
+def _is_allowed(role, http_method, resource_path):
+    """
+    Returns (allowed: bool, reason: str). Reason is meaningful only on deny.
+    """
     try:
-        notes_table.put_item(Item=item)
-        return response(201, {"status": "success", "data": item})
+        result = roles_table.get_item(Key={"role": role})
     except Exception as e:
-        return response(500, {"status": "error", "error": "CREATE_FAILED", "message": str(e)})
+        logger.exception("Failed to query roles table")
+        return False, f"roles_lookup_error:{e}"
+
+    item = result.get("Item")
+    if not item:
+        return False, "role_not_found"
+
+    permissions = item.get("permissions", [])
+    for perm in permissions:
+        pattern = perm.get("resource", "")
+        actions = perm.get("actions", [])
+        if _path_matches(pattern, resource_path) and http_method in actions:
+            return True, ""
+
+    return False, "no_matching_permission"
 
 
-def handle_get_note(user_id, note_id):
-    try:
-        result = notes_table.get_item(
-            Key={"userId": user_id, "noteId": note_id}
-        )
-        note = result.get("Item")
-        if not note:
-            return response(404, {"status": "error", "error": "NOT_FOUND", "message": "Note not found."})
-        return response(200, {"status": "success", "data": note})
-    except Exception as e:
-        return response(500, {"status": "error", "error": "GET_FAILED", "message": str(e)})
+def _path_matches(pattern, path):
+    pattern_parts = [p for p in pattern.split("/") if p]
+    path_parts = [p for p in path.split("/") if p]
+
+    if len(pattern_parts) != len(path_parts):
+        return False
+
+    for pat, actual in zip(pattern_parts, path_parts):
+        if pat == "*":
+            continue
+        if pat != actual:
+            return False
+    return True
 
 
-def handle_update_note(user_id, note_id, body):
-    title = body.get("title", "").strip()
-    content = body.get("content")
-
-    if not title and content is None:
-        return response(400, {"status": "error", "error": "MISSING_FIELDS", "message": "At least one of title or content is required."})
-
-    if title and len(title) > MAX_TITLE_LENGTH:
-        return response(400, {"status": "error", "error": "VALIDATION_ERROR", "message": f"Title must be under {MAX_TITLE_LENGTH} characters."})
-
-    if content is not None and len(content) > MAX_CONTENT_LENGTH:
-        return response(400, {"status": "error", "error": "VALIDATION_ERROR", "message": f"Content must be under {MAX_CONTENT_LENGTH} characters."})
-
-    try:
-        result = notes_table.get_item(
-            Key={"userId": user_id, "noteId": note_id}
-        )
-        if not result.get("Item"):
-            return response(404, {"status": "error", "error": "NOT_FOUND", "message": "Note not found."})
-    except Exception as e:
-        return response(500, {"status": "error", "error": "UPDATE_FAILED", "message": str(e)})
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    update_parts = ["updatedAt = :updatedAt"]
-    expr_values = {":updatedAt": now}
-    expr_names = {}
-
-    if title:
-        update_parts.append("#title = :title")
-        expr_values[":title"] = title
-        expr_names["#title"] = "title"
-    if content is not None:
-        update_parts.append("#content = :content")
-        expr_values[":content"] = content
-        expr_names["#content"] = "content"
-
-    update_expression = "SET " + ", ".join(update_parts)
-
-    try:
-        kwargs = {
-            "Key": {"userId": user_id, "noteId": note_id},
-            "UpdateExpression": update_expression,
-            "ExpressionAttributeValues": expr_values,
-            "ReturnValues": "ALL_NEW",
-        }
-        if expr_names:
-            kwargs["ExpressionAttributeNames"] = expr_names
-        result = notes_table.update_item(**kwargs)
-        return response(200, {"status": "success", "data": result.get("Attributes", {})})
-    except Exception as e:
-        return response(500, {"status": "error", "error": "UPDATE_FAILED", "message": str(e)})
-
-
-def handle_delete_note(user_id, note_id, role):
-    # Defense in depth: Lambda Authorizer also blocks non-admins from DELETE,
-    # but we enforce it here too as a safety net.
-    if role != "admin":
-        return response(403, {"status": "error", "error": "FORBIDDEN", "message": "Only admins can delete notes."})
-
-    try:
-        result = notes_table.get_item(
-            Key={"userId": user_id, "noteId": note_id}
-        )
-        if not result.get("Item"):
-            return response(404, {"status": "error", "error": "NOT_FOUND", "message": "Note not found."})
-    except Exception as e:
-        return response(500, {"status": "error", "error": "DELETE_FAILED", "message": str(e)})
-
-    try:
-        notes_table.delete_item(
-            Key={"userId": user_id, "noteId": note_id}
-        )
-        return response(200, {"status": "success", "message": f"Note {note_id} deleted."})
-    except Exception as e:
-        return response(500, {"status": "error", "error": "DELETE_FAILED", "message": str(e)})
-
-
-def response(status_code, body, extra_headers=None):
-    """Build API Gateway compatible response."""
-    headers = {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
-    }
-    if extra_headers:
-        headers.update(extra_headers)
+def _build_policy(principal_id, effect, method_arn, context):
     return {
-        "statusCode": status_code,
-        "headers": headers,
-        "body": json.dumps(body, default=str)
+        "principalId": principal_id or "anonymous",
+        "policyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Action": "execute-api:Invoke",
+                    "Effect": effect,
+                    "Resource": method_arn,
+                }
+            ],
+        },
+        "context": {k: (v if v is not None else "") for k, v in context.items()},
     }
