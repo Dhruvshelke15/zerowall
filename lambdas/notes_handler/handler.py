@@ -1,4 +1,13 @@
+"""
+ZeroWall Lambda Authorizer.
 
+Runs on every protected API request. Validates the JWT, looks up the
+caller's role permissions, and returns an IAM policy that either allows
+or denies the specific method+resource being requested.
+
+Returned context (userId, role, username) is forwarded to downstream
+Lambdas via event.requestContext.authorizer.
+"""
 
 import json
 import logging
