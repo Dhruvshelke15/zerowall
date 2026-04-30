@@ -285,8 +285,28 @@ else
     fi
 fi
 
-# --- S08: Rate limiting (sequential, not parallel) -------------------------
-print_scenario "S08 - Rate limiting ($RATE_LIMIT_TARGET sequential GETs)"
+# --- S08: Tampered token --------------------------------------------------
+print_scenario "S08 - Tampered token"
+# Flip the last character of the signature segment - guaranteed signature mismatch
+TAMPERED_TOKEN="${USER_TOKEN%?}X"
+print_curl "POST $BASE_URL/notes (Authorization: Bearer <TAMPERED_TOKEN>)"
+status=$(http_status POST /notes "$TAMPERED_TOKEN" '{"title":"x","content":"y"}')
+assert_status 401 "$status" "S08 Tampered token"
+
+# --- S09: Replay (same token used twice) ----------------------------------
+print_scenario "S09 - Replay (reusing valid token)"
+print_curl "POST $BASE_URL/notes  x2 (same token)"
+status1=$(http_status POST /notes "$USER_TOKEN" '{"title":"replay1","content":"a"}')
+status2=$(http_status POST /notes "$USER_TOKEN" '{"title":"replay2","content":"b"}')
+if [[ "$status1" == "201" && "$status2" == "201" ]]; then
+    record "S09 Replay (token valid)" PASS "both calls 201. Token expiry is the protection."
+else
+    record "S09 Replay (token valid)" FAIL "got $status1 / $status2"
+fi
+
+# --- S10: Rate limiting (sequential, not parallel) ------------------------
+# Runs LAST because it depletes the user's rate-limit window for ~60s.
+print_scenario "S10 - Rate limiting ($RATE_LIMIT_TARGET sequential GETs)"
 print_curl "GET $BASE_URL/notes  x$RATE_LIMIT_TARGET"
 echo "${DIM}This takes ~$(( RATE_LIMIT_TARGET / 10 )) seconds. CloudShell-safe sequential loop.${RESET}"
 
@@ -308,30 +328,11 @@ done
 
 echo "  200: $count_200    429: $count_429    other: $count_other    first 429 at request: $first_429_at"
 if [[ $count_429 -gt 0 && $first_429_at -ge 80 && $first_429_at -le 120 ]]; then
-    record "S08 Rate limiting" PASS "$count_429 requests blocked, first 429 at #$first_429_at"
+    record "S10 Rate limiting" PASS "$count_429 requests blocked, first 429 at #$first_429_at"
 elif [[ $count_429 -gt 0 ]]; then
-    record "S08 Rate limiting" PASS "blocked $count_429 requests (first 429 at #$first_429_at, expected ~100). Confirm RATE_LIMIT_PER_MINUTE."
+    record "S10 Rate limiting" PASS "blocked $count_429 requests (first 429 at #$first_429_at, expected ~100). Confirm RATE_LIMIT_PER_MINUTE."
 else
-    record "S08 Rate limiting" FAIL "no 429s seen. Confirm RATE_LIMIT_PER_MINUTE=100 on zerowall-notes-handler."
-fi
-
-# --- S09: Tampered token --------------------------------------------------
-print_scenario "S09 - Tampered token"
-# Flip the last character of the signature segment - guaranteed signature mismatch
-TAMPERED_TOKEN="${USER_TOKEN%?}X"
-print_curl "POST $BASE_URL/notes (Authorization: Bearer <TAMPERED_TOKEN>)"
-status=$(http_status POST /notes "$TAMPERED_TOKEN" '{"title":"x","content":"y"}')
-assert_status 401 "$status" "S09 Tampered token"
-
-# --- S10: Replay (same token used twice) ----------------------------------
-print_scenario "S10 - Replay (reusing valid token)"
-print_curl "POST $BASE_URL/notes  x2 (same token)"
-status1=$(http_status POST /notes "$USER_TOKEN" '{"title":"replay1","content":"a"}')
-status2=$(http_status POST /notes "$USER_TOKEN" '{"title":"replay2","content":"b"}')
-if [[ "$status1" == "201" && "$status2" == "201" ]]; then
-    record "S10 Replay (token valid)" PASS "both calls 201. Token expiry is the protection."
-else
-    record "S10 Replay (token valid)" FAIL "got $status1 / $status2"
+    record "S10 Rate limiting" FAIL "no 429s seen. Confirm RATE_LIMIT_PER_MINUTE=100 on zerowall-notes-handler."
 fi
 
 # ------------------------------------------------------------------------------
