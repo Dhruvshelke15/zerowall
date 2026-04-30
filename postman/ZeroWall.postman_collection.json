@@ -1,0 +1,670 @@
+{
+  "info": {
+    "_postman_id": "e87b4112-f8c7-430e-a56c-6fe0ff814c2b",
+    "name": "ZeroWall - Zero-Trust API Gateway",
+    "description": "Postman collection for the ZeroWall demo. Mirrors the 10 scenarios in scripts/test_attacks.sh.\n\n## Setup\n1. Import this collection AND the ZeroWall environment file.\n2. Select the 'ZeroWall - Dev' environment from the dropdown.\n3. Promote user2 to admin once via AWS CLI:\n   `aws cognito-idp admin-update-user-attributes --user-pool-id us-east-2_ZEaM80bI4 --username desairaj1807@gmail.com --user-attributes Name=custom:role,Value=admin --region us-east-2`\n\n## Run order (manual)\nAuth \u2192 S02 (User), Auth \u2192 S02b (Admin), then any scenario.\n\n## Run order (Collection Runner)\nRun the entire collection. Folders execute in this order: Auth, Notes CRUD, RBAC, Attacks, Rate Limiting.\nNote: the Rate Limiting folder request should be excluded from a normal collection run (it depletes the user's window). Run it separately with iterations=150.\n\n## Scenario index\nS01 Signup, S02 Login, S03 Create note, S04 No token, S05 Expired token, S06 DELETE as user, S07 DELETE as admin, S08 Tampered token, S09 Replay, S10 Rate limit.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "S01 - Sign up",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/signup",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "signup"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\": \"{{userEmail}}\", \"password\": \"{{userPassword}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Registers a new user. Reusing an existing email returns a user-exists error, which still proves the endpoint is reachable."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Sign up may return 200/201 (new) or 409/400 (already exists). Both prove the endpoint is reachable.",
+                  "pm.test('Endpoint reachable', () => {",
+                  "    const ok = [200, 201].includes(pm.response.code);",
+                  "    const userExists = [400, 409].includes(pm.response.code) && /exist/i.test(pm.response.text());",
+                  "    pm.expect(ok || userExists).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S02 - Login (User)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\": \"{{userEmail}}\", \"password\": \"{{userPassword}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Logs in the regular user. The test script saves the returned idToken to the userToken env var for subsequent requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.expect(pm.response.code).to.equal(200));",
+                  "const json = pm.response.json();",
+                  "const token = json.idToken || (json.data && json.data.idToken);",
+                  "pm.test('idToken returned', () => pm.expect(token).to.be.a('string'));",
+                  "if (token) { pm.environment.set('userToken', token); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S02b - Login (Admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\": \"{{adminEmail}}\", \"password\": \"{{adminPassword}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Logs in the admin user. Assumes user2 has been promoted to custom:role=admin via the AWS CLI before running this request."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.expect(pm.response.code).to.equal(200));",
+                  "const json = pm.response.json();",
+                  "const token = json.idToken || (json.data && json.data.idToken);",
+                  "pm.test('idToken returned', () => pm.expect(token).to.be.a('string'));",
+                  "if (token) { pm.environment.set('adminToken', token); }"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Cognito-backed signup and login. Login requests automatically save tokens to env vars."
+    },
+    {
+      "name": "Notes CRUD",
+      "item": [
+        {
+          "name": "S03 - Create note (valid token)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"Postman test note\", \"content\": \"Created via Postman S03\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Creates a note as the regular user. Saves the returned noteId for use in later scenarios."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201', () => pm.expect(pm.response.code).to.equal(201));",
+                  "const json = pm.response.json();",
+                  "const noteId = (json.data && json.data.noteId) || json.noteId;",
+                  "pm.test('noteId returned', () => pm.expect(noteId).to.be.a('string'));",
+                  "if (noteId) { pm.environment.set('userNoteId', noteId); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List notes (GET /notes)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "description": "Lists all notes for the authenticated user."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.expect(pm.response.code).to.equal(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get note by id (GET /notes/{id})",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes/{{userNoteId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes", "{{userNoteId}}"]
+            },
+            "description": "Retrieves the note created in S03."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.expect(pm.response.code).to.equal(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Update note (PUT /notes/{id})",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes/{{userNoteId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes", "{{userNoteId}}"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"Updated title\", \"content\": \"Updated content\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Updates the note from S03."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.expect(pm.response.code).to.equal(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Standard CRUD operations against /notes. All require the userToken env var to be set (run Auth \u2192 S02 first)."
+    },
+    {
+      "name": "RBAC",
+      "item": [
+        {
+          "name": "Setup - Create admin note",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"Admin note for S07\", \"content\": \"To be deleted by S07\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Creates a note as admin so S07 has something to delete. Run before S07. Requires adminToken (Auth \u2192 S02b first)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201', () => pm.expect(pm.response.code).to.equal(201));",
+                  "const json = pm.response.json();",
+                  "const noteId = (json.data && json.data.noteId) || json.noteId;",
+                  "if (noteId) { pm.environment.set('adminNoteId', noteId); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S06 - DELETE as user (expect 403)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes/{{userNoteId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes", "{{userNoteId}}"]
+            },
+            "description": "Regular user attempts DELETE. RBAC should reject with 403 (user role does not have DELETE permission)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 403', () => pm.expect(pm.response.code).to.equal(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S07 - DELETE as admin (expect 200)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes/{{adminNoteId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes", "{{adminNoteId}}"]
+            },
+            "description": "Admin deletes their own note. Note: data isolation means admin can only DELETE notes they own (userId is always the authorizer-supplied partition key)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or 204', () => pm.expect([200, 204]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Role-based access control. user role can read/write own notes but cannot DELETE; admin can DELETE."
+    },
+    {
+      "name": "Attacks",
+      "item": [
+        {
+          "name": "S04 - Create note WITHOUT token (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"should fail\", \"content\": \"no auth\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Sends POST /notes with no Authorization header. API Gateway rejects with 401 before reaching the authorizer."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.expect(pm.response.code).to.equal(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S05 - Expired token (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{expiredToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"should fail\", \"content\": \"expired\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Requires the expiredToken env var to be set. Capture one via `./scripts/test_attacks.sh --prep-expired` and wait 65+ minutes for it to expire, then paste into the env var."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const expired = pm.environment.get('expiredToken');",
+                  "if (!expired) {",
+                  "    console.warn('\u26a0\ufe0f  S05 skipped: set the expiredToken env var (capture one via test_attacks.sh --prep-expired and wait 65+ min).');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const expired = pm.environment.get('expiredToken');",
+                  "if (!expired) {",
+                  "    pm.test('SKIPPED - no expiredToken env var set', () => true);",
+                  "} else {",
+                  "    pm.test('Status is 401', () => pm.expect(pm.response.code).to.equal(401));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S08 - Tampered token (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tamperedToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"should fail\", \"content\": \"tampered\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Pre-request script takes userToken and replaces the last character with X. The authorizer should reject the tampered token via signature verification failure."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const userToken = pm.environment.get('userToken');",
+                  "if (!userToken) {",
+                  "    throw new Error('userToken not set. Run Auth \u2192 S02 - Login (User) first.');",
+                  "}",
+                  "// Match the bash test exactly: replace the last character with X",
+                  "const tampered = userToken.slice(0, -1) + 'X';",
+                  "pm.environment.set('tamperedToken', tampered);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', () => pm.expect(pm.response.code).to.equal(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "S09 - Replay (reuse valid token, expect 201)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"title\": \"replay\", \"content\": \"valid token reused\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Reuses a valid token. Both calls succeed - this proves token expiry IS the protection against replay, not a one-time-use mechanism. Run twice (or iterations=2 in Runner)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201', () => pm.expect(pm.response.code).to.equal(201));",
+                  "// Run this request twice in a row (or via Runner with iterations=2). Both calls",
+                  "// should succeed - this proves token expiry is the only protection against replay,",
+                  "// not a one-time-use mechanism."
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Adversarial scenarios. Each verifies a specific security guarantee."
+    },
+    {
+      "name": "Rate Limiting",
+      "item": [
+        {
+          "name": "S10 - Rate limit GET /notes (run via Runner, iterations=150)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/notes",
+              "host": ["{{baseUrl}}"],
+              "path": ["notes"]
+            },
+            "description": "To reproduce the rate-limit demo:\n1. Open Collection Runner\n2. Select only this request\n3. Set Iterations: 150, Delay: 0\n4. Run\n\nExpected: ~99 requests return 200, then ~50 return 429 starting around iteration 100. If you re-run within the same minute window, you'll see 429s immediately - wait 60s for the window to reset."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Run via Collection Runner with iterations=150 to reproduce the rate-limit demo.",
+                  "// Expected: ~99 requests return 200, then ~50 return 429 starting around #100.",
+                  "pm.test('Status is 200 or 429', () => pm.expect([200, 429]).to.include(pm.response.code));",
+                  "if (pm.response.code === 429) {",
+                  "    pm.test('Has rate-limit body', () => pm.expect(pm.response.text()).to.include('RATE_LIMITED'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Per-user, per-minute rate limiting (default 100/min, configurable via RATE_LIMIT_PER_MINUTE on zerowall-notes-handler)."
+    }
+  ]
+}
